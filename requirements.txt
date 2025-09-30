@@ -5,3 +5,4 @@ nltk
 openai
 python-dotenv
 python-multipart
+pinecone-client
