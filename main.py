@@ -12,6 +12,7 @@ import os
 import traceback
 import tempfile
 import re
+import uuid
 from collections import defaultdict
 
 # --- Dependencias de FastAPI ---
