@@ -11,3 +11,4 @@ sentence-transformers
 langchain-openai
 langchain-google-genai
 langchain-core
+PyMuPDF
