@@ -24,6 +24,7 @@ import nltk
 from nltk.tokenize import sent_tokenize
 from openai import OpenAI  # CAMBIO 1: Importar el cliente correcto
 from dotenv import load_dotenv
+from pinecone import Pinecone
 
 import nltk
 nltk.download('punkt')
@@ -64,6 +65,20 @@ client = OpenAI(
 )
 
 print("✅ Cliente de OpenAI inicializado.")
+
+try:
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+    if not PINECONE_INDEX_NAME:
+        raise ValueError("La variable de entorno PINECONE_INDEX_NAME no está configurada.")
+    
+    # Nos conectamos al índice
+    pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+    print(f"✅ Conexión al índice '{PINECONE_INDEX_NAME}' de Pinecone establecida.")
+
+except Exception as e:
+    print(f"ERROR CRÍTICO: No se pudo inicializar el cliente de Pinecone. Error: {e}")
+    pinecone_index = None
 
 def clean_pdf_text_robust(text):
     """Limpia texto de PDF de forma MÁS robusta para RAG, atacando patrones específicos."""
@@ -965,47 +980,65 @@ def embed_batch(batch_texts: list[str]) -> list[list[float]]:
         raise HTTPException(status_code=503, detail=f"Error al contactar el servicio de embeddings: {e}")
 
 
-@app.post("/process-pdf")
-async def process_pdf_and_create_embeddings(file: UploadFile = File(...)):
+@app.post("/process-and-save-pdf") # Opcional: cambia el nombre para ser más descriptivo
+async def process_and_save_pdf(file: UploadFile = File(...)):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF.")
+
+    # Asegurarse de que los clientes estén inicializados
+    if not client or not pinecone_index:
+        raise HTTPException(status_code=503, detail="Servicio no disponible: los clientes de IA o DB no están inicializados.")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
         temp_pdf.write(await file.read())
         temp_pdf_path = temp_pdf.name
 
     try:
-        print(f"Procesando archivo: {file.filename} (guardado en {temp_pdf_path})")
-        extraction_result = extract_and_clean_pdf_smart_stem(pdf_path=temp_pdf_path, debug_prints=True)
+        # --- Pasos 1 y 2 (Extracción y Chunking - Sin cambios) ---
+        extraction_result = extract_and_clean_pdf_smart_stem(pdf_path=temp_pdf_path)
         cleaned_text = extraction_result.get("cleaned_text")
-
-        if not cleaned_text or cleaned_text.isspace():
-            return JSONResponse(status_code=200, content={"message": "PDF procesado, no se extrajo texto válido.", "data": []})
-
-        chunks = chunk_text_by_sentences(cleaned_text, max_words=250, overlap_sentences=2)
+        if not cleaned_text:
+            return {"status": "success", "message": "PDF procesado, pero no se extrajo texto válido.", "vectors_added": 0}
+        
+        chunks = chunk_text_by_sentences(cleaned_text, max_words=250)
         if not chunks:
-            return JSONResponse(status_code=200, content={"message": "Se extrajo texto, pero no se generaron chunks.", "data": []})
+            return {"status": "success", "message": "Se extrajo texto, pero no se generaron chunks.", "vectors_added": 0}
+            
+        print(f"Texto dividido en {len(chunks)} chunks. Generando embeddings e insertando en Pinecone...")
 
-        print(f"Texto dividido en {len(chunks)} chunks. Generando embeddings...")
-        final_results = []
-        BATCH_SIZE = 100
+        # --- CAMBIO 3: Lógica de Inserción en Pinecone ---
+        vectors_to_upsert = []
+        BATCH_SIZE = 100 # Batch para generar embeddings
 
         for i in range(0, len(chunks), BATCH_SIZE):
             batch_chunks_text = chunks[i : i + BATCH_SIZE]
             batch_embeddings = embed_batch(batch_chunks_text)
 
             for j, chunk_text in enumerate(batch_chunks_text):
-                # (Opcional) Aquí puedes generar tus metadatos si lo deseas
-                # math_sections = detectar_secciones_matematicas(chunk_text)
+                # Generar un ID único para cada vector
+                chunk_id = str(uuid.uuid4())
                 
-                final_results.append({
-                    "text": chunk_text,
-                    "embedding": batch_embeddings[j],
-                    "metadata": { "chunk_index": i + j } 
+                # (Opcional) Generar metadatos
+                metadata = {
+                    "text": chunk_text, # Es una buena práctica guardar el texto también en los metadatos
+                    "original_filename": file.filename,
+                    "chunk_index": i + j
+                }
+
+                # Añadir el vector al lote que se va a insertar
+                vectors_to_upsert.append({
+                    "id": chunk_id,
+                    "values": batch_embeddings[j],
+                    "metadata": metadata
                 })
         
-        print(f"Proceso completado. Devolviendo {len(final_results)} chunks.")
-        return {"data": final_results}
+        # Insertar todos los vectores en Pinecone de una sola vez (muy eficiente)
+        if vectors_to_upsert:
+            pinecone_index.upsert(vectors=vectors_to_upsert)
+            print(f"Proceso completado. Se han insertado {len(vectors_to_upsert)} vectores en Pinecone.")
+        
+        # Devolver una respuesta de éxito a n8n
+        return {"status": "success", "vectors_added": len(vectors_to_upsert)}
 
     except Exception as e:
         print(f"ERROR INESPERADO: {e}")
@@ -1013,4 +1046,4 @@ async def process_pdf_and_create_embeddings(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {e}")
     finally:
         if os.path.exists(temp_pdf_path):
-            os.unlink(temp_pdf_path)
+            os.unlink(temp_pdf_path)```
