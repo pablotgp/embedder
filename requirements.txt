@@ -1,8 +1,13 @@
 fastapi
 uvicorn
-PyMuPDF
-nltk
-openai
 python-dotenv
-python-multipart
+pydantic
+# --- Librerías de RAG ---
 pinecone
+faiss-cpu
+numpy
+rank_bm25
+sentence-transformers
+langchain-openai
+langchain-google-genai
+langchain-core
