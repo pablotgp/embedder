@@ -1290,11 +1290,6 @@ print("--- Fin Celda 3 ---")
 
 
 
-# 1) Inicializa tu índice FAISS
-EMB_DIM = 1536
-
-==============================================================================
-
 # --- Endpoint para hacer preguntas (RAG) ---
 class QueryRequest(BaseModel):
     question: str
