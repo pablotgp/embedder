@@ -1066,23 +1066,30 @@ DIMENSION = 1536 # Dimensión de text-embedding-3-small
 
 K_FAISS_INITIAL = 100
 K_BM25_INITIAL = 100
-K_RERANK = 80
+K_RERANK = 50
 USE_DYNAMIC_K = True
 RERANKER_SCORE_THRESHOLD = 1.5
 MIN_CHUNKS_DYNAMIC = 3
 MAX_CHUNKS_DYNAMIC = 7
 
 # --- Diccionario para mantener el estado de la aplicación (modelos, índices, etc.) ---
-app_state = {}
+app_state = {"is_initialized": False} # Añadimos una bandera
+
+app = FastAPI() # Inicializamos la app directamente
 
 
+def initialize_retriever():
+    """
+    Carga todos los modelos y datos en memoria. Se llama solo la primera vez.
+    """
+    global app_state
+    if app_state.get("is_initialized"):
+        return
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("INFO: Iniciando el evento de startup del servicio RAG...")
+    print("INFO: Iniciando la carga perezosa (lazy loading) de modelos y datos...")
     try:
-        # --- 1. Cargar modelos de IA (Embedding, Reranker, LLM) ---
-        print("  Startup: 1. Cargando modelos de IA...")
+        # 1. Cargar modelos de IA
+        print("  LazyLoad: 1. Cargando modelos de IA...")
         if not os.getenv("OPENAI_API_KEY") or not os.getenv("GOOGLE_API_KEY"):
             raise ValueError("Faltan claves de API de OpenAI o Google.")
         
@@ -1091,8 +1098,8 @@ async def lifespan(app: FastAPI):
         app_state["llm"] = ChatGoogleGenerativeAI(model=LLM_MODEL_NAME, google_api_key=os.getenv("GOOGLE_API_KEY"))
         print("     Modelos de IA cargados.")
 
-        # --- 2. Descargar TODOS los datos desde Pinecone ---
-        print("  Startup: 2. Conectando a Pinecone para descargar el corpus...")
+        # 2. Descargar datos de Pinecone
+        print("  LazyLoad: 2. Descargando datos de Pinecone...")
         if not os.getenv("PINECONE_API_KEY") or not os.getenv("PINECONE_INDEX_NAME"):
             raise ValueError("Faltan las variables de entorno de Pinecone.")
             
@@ -1101,54 +1108,41 @@ async def lifespan(app: FastAPI):
         
         index_stats = pinecone_index.describe_index_stats()
         total_vectors = index_stats['total_vector_count']
-        print(f"     Índice '{os.getenv('PINECONE_INDEX_NAME')}' tiene {total_vectors} vectores. Descargando...")
-
-        # Hacemos una consulta "match-all" para obtener todos los IDs y datos.
+        
         response = pinecone_index.query(vector=[0.0] * DIMENSION, top_k=total_vectors, include_metadata=True, include_values=True)
         
-        all_vectors = []
-        app_state["texts"] = []
-        app_state["metadatas"] = []
-        
-        # Ordenamos los resultados por el índice del chunk para mantener la consistencia
+        all_vectors, texts, metadatas = [], [], []
         sorted_matches = sorted(response['matches'], key=lambda x: x['metadata'].get('chunk_index', 0))
 
         for match in sorted_matches:
             all_vectors.append(match['values'])
-            app_state["texts"].append(match['metadata']['text'])
-            app_state["metadatas"].append(match['metadata'])
+            texts.append(match['metadata']['text'])
+            metadatas.append(match['metadata'])
             
-        if len(all_vectors) != total_vectors:
-            print(f"ADVERTENCIA: Se esperaban {total_vectors} vectores, pero se descargaron {len(all_vectors)}.")
+        app_state["texts"] = texts
+        app_state["metadatas"] = metadatas
+        print(f"     Descarga completa: {len(all_vectors)} vectores.")
         
-        print(f"     Descarga completa: {len(all_vectors)} vectores y metadatos recuperados de Pinecone.")
-        
-        # --- 3. Construir los índices locales en memoria ---
-        print("  Startup: 3. Construyendo índices locales FAISS y BM25 en memoria...")
-        
+        # 3. Construir índices locales
+        print("  LazyLoad: 3. Construyendo índices locales...")
         vectors_np = np.array(all_vectors).astype('float32')
         app_state["faiss_index"] = faiss.IndexFlatL2(DIMENSION)
         app_state["faiss_index"].add(vectors_np)
-        print(f"     Índice FAISS construido ({app_state['faiss_index'].ntotal} vectores).")
         
-        tokenized_docs = [simple_tokenizer(txt) for txt in app_state["texts"]]
+        tokenized_docs = [simple_tokenizer(txt) for txt in texts]
         app_state["bm25"] = BM25Okapi(tokenized_docs)
-        print("     Índice BM25 construido.")
+        print("     Índices locales construidos.")
         
-        print("INFO: Inicialización y carga de datos completada. El servicio está listo.")
+        app_state["is_initialized"] = True
+        print("INFO: Carga perezosa completada. El sistema está listo para operar.")
         
     except Exception as e:
-        print(f"ERROR FATAL durante el startup: {e}")
+        app_state["is_initialized"] = False # Marcar como no inicializado en caso de error
+        print(f"ERROR FATAL durante la inicialización perezosa: {e}")
         traceback.print_exc()
-        raise RuntimeError("Fallo al inicializar/descargar datos en el startup.") from e
-        
-    yield # La aplicación se ejecuta aquí
-    
-    print("INFO: Evento de shutdown ejecutado. Limpiando estado.")
-    app_state.clear()
+        # No lanzamos RuntimeError para no romper el servidor, pero el estado quedará como no inicializado
 
 
-app = FastAPI(lifespan=lifespan)
 
 # --- Celda 3: Funciones Auxiliares ---
 # --- Celda 3: Funciones Auxiliares ---
@@ -1439,6 +1433,12 @@ class QueryRequest(BaseModel):
 
 @app.post("/ask")
 async def ask_rag_question(request: QueryRequest):
+    initialize_retriever()
+    
+    # Comprobar si la inicialización tuvo éxito
+    if not app_state.get("is_initialized"):
+        raise HTTPException(status_code=503, detail="El servicio no está listo. La inicialización de modelos falló. Revisa los logs.")
+        
     user_question = request.question
     topic = request.topic
 
