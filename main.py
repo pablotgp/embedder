@@ -47,47 +47,85 @@ except nltk.downloader.DownloadError:
     nltk.download('punkt', quiet=True)
 
 
-
-
-# 1. Cargar las variables de entorno desde el archivo .env
 load_dotenv()
 
-app = FastAPI()
+# --- Parámetros de Modelos y Búsqueda ---
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+RERANKER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-12-v2'
+LLM_MODEL_NAME = "gemini-1.5-flash-latest"
+DIMENSION = 1536 # Dimensión de text-embedding-3-small
 
-# 2. Obtener la clave de API desde las variables de entorno
-#    Usamos os.getenv() para leer la variable que definimos en el archivo .env
-openai_api_key = os.getenv("OPENAI_API_KEY")
+K_FAISS_INITIAL = 100
+K_BM25_INITIAL = 100
+K_RERANK = 50
+USE_DYNAMIC_K = True
+RERANKER_SCORE_THRESHOLD = 1.5
+MIN_CHUNKS_DYNAMIC = 3
+MAX_CHUNKS_DYNAMIC = 7
 
-# 3. (MUY IMPORTANTE) Verificación de seguridad y usabilidad
-if not openai_api_key:
-    # Si la clave no se encuentra, detenemos la ejecución con un error claro.
-    raise ValueError("ERROR: La clave de API de OpenAI no se encontró. "
-                     "Asegúrate de crear un archivo '.env' en el mismo directorio que este notebook "
-                     "y añadir la línea: OPENAI_API_KEY='sk-...'")
-else:
-    print("✅ Clave de API de OpenAI cargada exitosamente desde el archivo .env.")
 
-# 4. Inicializa el cliente usando la clave cargada de forma segura
-client = OpenAI(
-    api_key=openai_api_key
-)
+# --- Diccionario para mantener el estado de la aplicación (modelos, índices, etc.) ---
+app_state = {"is_initialized": False} # Añadimos una bandera
 
-print("✅ Cliente de OpenAI inicializado.")
+app = FastAPI() # Inicializamos la app directamente
+def initialize_retriever():
+    global app_state
+    if app_state.get("is_initialized"):
+        return
 
-try:
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
-    if not PINECONE_INDEX_NAME:
-        raise ValueError("La variable de entorno PINECONE_INDEX_NAME no está configurada.")
-    
-    # Nos conectamos al índice
-    pinecone_index = pc.Index(PINECONE_INDEX_NAME)
-    print(f"✅ Conexión al índice '{PINECONE_INDEX_NAME}' de Pinecone establecida.")
+    print("INFO: Iniciando la carga perezosa de modelos y datos...")
+    try:
+        # Descargar NLTK
+        nltk.download('punkt', quiet=True)
 
-except Exception as e:
-    print(f"ERROR CRÍTICO: No se pudo inicializar el cliente de Pinecone. Error: {e}")
-    pinecone_index = None
+        # Cargar modelos de IA (OpenAI y Google)
+        print("  LazyLoad: 1. Cargando modelos de IA...")
+        app_state["embeddings_model"] = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME, api_key=os.getenv("OPENAI_API_KEY"))
+        app_state["reranker"] = CrossEncoder(RERANKER_MODEL)
+        app_state["llm"] = ChatGoogleGenerativeAI(model=LLM_MODEL_NAME, google_api_key=os.getenv("GOOGLE_API_KEY"))
+        print("     Modelos de IA cargados.")
+
+        # Conectar a Pinecone y descargar datos
+        print("  LazyLoad: 2. Descargando datos de Pinecone...")
+        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+        pinecone_index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
+        app_state["pinecone_index_for_upsert"] = pinecone_index
+
+        index_stats = pinecone_index.describe_index_stats()
+        total_vectors = index_stats['total_vector_count']
+        
+        response = pinecone_index.query(vector=[0.0] * DIMENSION, top_k=total_vectors, include_metadata=True, include_values=True)
+        
+        all_vectors, texts, metadatas = [], [], []
+        sorted_matches = sorted(response['matches'], key=lambda x: x['metadata'].get('chunk_index', 0))
+
+        for match in sorted_matches:
+            all_vectors.append(match['values'])
+            texts.append(match['metadata']['text'])
+            metadatas.append(match['metadata'])
+            
+        app_state["texts"] = texts
+        app_state["metadatas"] = metadatas
+        print(f"     Descarga completa.")
+        
+        # Construir índices locales
+        print("  LazyLoad: 3. Construyendo índices locales...")
+        vectors_np = np.array(all_vectors).astype('float32')
+        app_state["faiss_index"] = faiss.IndexFlatL2(DIMENSION)
+        app_state["faiss_index"].add(vectors_np)
+        
+        tokenized_docs = [simple_tokenizer(txt) for txt in texts]
+        app_state["bm25"] = BM25Okapi(tokenized_docs)
+        print("     Índices locales construidos.")
+        
+        app_state["is_initialized"] = True
+        print("INFO: Carga perezosa completada. El sistema está listo.")
+        
+    except Exception as e:
+        app_state["is_initialized"] = False
+        print(f"ERROR FATAL durante la inicialización perezosa: {e}")
+        traceback.print_exc()
+
 
 def clean_pdf_text_robust(text):
     """Limpia texto de PDF de forma MÁS robusta para RAG, atacando patrones específicos."""
@@ -967,183 +1005,6 @@ def chunk_text_by_sentences(text, max_words=200, overlap_sentences=1):
             break
     return chunks
 
-
-
-# 1) Inicializa tu índice FAISS
-EMB_DIM = 1536
-
-
-# ==============================================================================
-# 3. LÓGICA DEL ENDPOINT DE LA API
-# ==============================================================================
-
-def embed_batch(batch_texts: list[str]) -> list[list[float]]:
-    """Función para generar embeddings para un lote de textos."""
-    if not client:
-        raise HTTPException(status_code=500, detail="El cliente de OpenAI no está configurado en el servidor.")
-    try:
-        response = client.embeddings.create(
-            model=EMBEDDING_MODEL_NAME, # Usa la variable global
-            input=batch_texts
-        )
-        return [item.embedding for item in response.data]
-    except Exception as e:
-        print(f"ERROR: Falló la llamada a la API de embeddings de OpenAI. Error: {e}")
-        raise HTTPException(status_code=503, detail=f"Error al contactar el servicio de embeddings: {e}")
-
-
-@app.post("/process-and-save-pdf")
-async def process_and_save_pdf(file: UploadFile = File(...)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="El archivo debe ser un PDF.")
-
-    # Asegurarse de que los clientes estén inicializados
-    if not client or not pinecone_index:
-        raise HTTPException(status_code=503, detail="Servicio no disponible: los clientes de IA o DB no están inicializados.")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
-        temp_pdf.write(await file.read())
-        temp_pdf_path = temp_pdf.name
-
-    try:
-        # --- Pasos 1 y 2 (Extracción y Chunking) ---
-        extraction_result = extract_and_clean_pdf_smart_stem(pdf_path=temp_pdf_path)
-        cleaned_text = extraction_result.get("cleaned_text")
-        if not cleaned_text:
-            return {"status": "success", "message": "PDF procesado, pero no se extrajo texto válido.", "vectors_added": 0}
-        
-        chunks = chunk_text_by_sentences(cleaned_text, max_words=250)
-        if not chunks:
-            return {"status": "success", "message": "Se extrajo texto, pero no se generaron chunks.", "vectors_added": 0}
-            
-        print(f"Texto dividido en {len(chunks)} chunks. Generando embeddings e insertando en Pinecone...")
-
-        # --- Lógica de Inserción en Pinecone ---
-        vectors_to_upsert = []
-        BATCH_SIZE = 100 # Batch para generar embeddings
-
-        for i in range(0, len(chunks), BATCH_SIZE):
-            batch_chunks_text = chunks[i : i + BATCH_SIZE]
-            batch_embeddings = embed_batch(batch_chunks_text)
-
-            for j, chunk_text in enumerate(batch_chunks_text):
-                chunk_id = str(uuid.uuid4())
-                metadata = {
-                    "text": chunk_text,
-                    "original_filename": file.filename,
-                    "chunk_index": i + j
-                }
-                vectors_to_upsert.append({
-                    "id": chunk_id,
-                    "values": batch_embeddings[j],
-                    "metadata": metadata
-                })
-        
-        if vectors_to_upsert:
-            pinecone_index.upsert(vectors=vectors_to_upsert)
-            print(f"Proceso completado. Se han insertado {len(vectors_to_upsert)} vectores en Pinecone.")
-        
-        return {"status": "success", "vectors_added": len(vectors_to_upsert)}
-
-    except Exception as e:
-        print(f"ERROR INESPERADO: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {e}")
-    
-    # --- BLOQUE 'finally' CORREGIDO ---
-    finally:
-        if os.path.exists(temp_pdf_path):
-            os.unlink(temp_pdf_path)
-
-
-load_dotenv()
-
-# --- Parámetros de Modelos y Búsqueda ---
-EMBEDDING_MODEL_NAME = "text-embedding-3-small"
-RERANKER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-12-v2'
-LLM_MODEL_NAME = "gemini-1.5-flash-latest"
-DIMENSION = 1536 # Dimensión de text-embedding-3-small
-
-K_FAISS_INITIAL = 100
-K_BM25_INITIAL = 100
-K_RERANK = 50
-USE_DYNAMIC_K = True
-RERANKER_SCORE_THRESHOLD = 1.5
-MIN_CHUNKS_DYNAMIC = 3
-MAX_CHUNKS_DYNAMIC = 7
-
-# --- Diccionario para mantener el estado de la aplicación (modelos, índices, etc.) ---
-app_state = {"is_initialized": False} # Añadimos una bandera
-
-app = FastAPI() # Inicializamos la app directamente
-
-
-def initialize_retriever():
-    """
-    Carga todos los modelos y datos en memoria. Se llama solo la primera vez.
-    """
-    global app_state
-    if app_state.get("is_initialized"):
-        return
-
-    print("INFO: Iniciando la carga perezosa (lazy loading) de modelos y datos...")
-    try:
-        # 1. Cargar modelos de IA
-        print("  LazyLoad: 1. Cargando modelos de IA...")
-        if not os.getenv("OPENAI_API_KEY") or not os.getenv("GOOGLE_API_KEY"):
-            raise ValueError("Faltan claves de API de OpenAI o Google.")
-        
-        app_state["embeddings_model"] = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
-        app_state["reranker"] = CrossEncoder(RERANKER_MODEL)
-        app_state["llm"] = ChatGoogleGenerativeAI(model=LLM_MODEL_NAME, google_api_key=os.getenv("GOOGLE_API_KEY"))
-        print("     Modelos de IA cargados.")
-
-        # 2. Descargar datos de Pinecone
-        print("  LazyLoad: 2. Descargando datos de Pinecone...")
-        if not os.getenv("PINECONE_API_KEY") or not os.getenv("PINECONE_INDEX_NAME"):
-            raise ValueError("Faltan las variables de entorno de Pinecone.")
-            
-        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-        pinecone_index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
-        
-        index_stats = pinecone_index.describe_index_stats()
-        total_vectors = index_stats['total_vector_count']
-        
-        response = pinecone_index.query(vector=[0.0] * DIMENSION, top_k=total_vectors, include_metadata=True, include_values=True)
-        
-        all_vectors, texts, metadatas = [], [], []
-        sorted_matches = sorted(response['matches'], key=lambda x: x['metadata'].get('chunk_index', 0))
-
-        for match in sorted_matches:
-            all_vectors.append(match['values'])
-            texts.append(match['metadata']['text'])
-            metadatas.append(match['metadata'])
-            
-        app_state["texts"] = texts
-        app_state["metadatas"] = metadatas
-        print(f"     Descarga completa: {len(all_vectors)} vectores.")
-        
-        # 3. Construir índices locales
-        print("  LazyLoad: 3. Construyendo índices locales...")
-        vectors_np = np.array(all_vectors).astype('float32')
-        app_state["faiss_index"] = faiss.IndexFlatL2(DIMENSION)
-        app_state["faiss_index"].add(vectors_np)
-        
-        tokenized_docs = [simple_tokenizer(txt) for txt in texts]
-        app_state["bm25"] = BM25Okapi(tokenized_docs)
-        print("     Índices locales construidos.")
-        
-        app_state["is_initialized"] = True
-        print("INFO: Carga perezosa completada. El sistema está listo para operar.")
-        
-    except Exception as e:
-        app_state["is_initialized"] = False # Marcar como no inicializado en caso de error
-        print(f"ERROR FATAL durante la inicialización perezosa: {e}")
-        traceback.print_exc()
-        # No lanzamos RuntimeError para no romper el servidor, pero el estado quedará como no inicializado
-
-
-
 # --- Celda 3: Funciones Auxiliares ---
 # --- Celda 3: Funciones Auxiliares ---
 
@@ -1427,6 +1288,14 @@ print("INFO: Celda 3 - Funciones auxiliares definidas (tokenizer, pesos, normali
 print(f"  - Usando tokenizer: {tokenizer_for_bm25.__name__}")
 print("--- Fin Celda 3 ---")
 
+
+
+# 1) Inicializa tu índice FAISS
+EMB_DIM = 1536
+
+==============================================================================
+
+# --- Endpoint para hacer preguntas (RAG) ---
 class QueryRequest(BaseModel):
     question: str
     topic: str | None = None
@@ -1435,18 +1304,15 @@ class QueryRequest(BaseModel):
 async def ask_rag_question(request: QueryRequest):
     initialize_retriever()
     
-    # Comprobar si la inicialización tuvo éxito
     if not app_state.get("is_initialized"):
-        raise HTTPException(status_code=503, detail="El servicio no está listo. La inicialización de modelos falló. Revisa los logs.")
+        raise HTTPException(status_code=503, detail="El servicio no está listo. Falló la inicialización.")
         
     user_question = request.question
     topic = request.topic
 
     try:
-        # --- 1. Búsqueda Híbrida ---
         query_embedding = app_state["embeddings_model"].embed_query(user_question)
         query_embedding_np = np.array([query_embedding], dtype=np.float32)
-
         distances, faiss_indices = app_state["faiss_index"].search(query_embedding_np, K_FAISS_INITIAL)
         faiss_sims = 1.0 / (1.0 + distances[0])
         faiss_results = {idx: sim for idx, sim in zip(faiss_indices[0], faiss_sims) if idx != -1}
@@ -1456,73 +1322,81 @@ async def ask_rag_question(request: QueryRequest):
         bm25_top_indices = np.argsort(all_bm25_scores)[::-1][:K_BM25_INITIAL]
         bm25_results = {idx: all_bm25_scores[idx] for idx in bm25_top_indices if all_bm25_scores[idx] > 0}
 
-        # --- 2. Fusión y Re-ranking ---
         peso_bm25, peso_emb = calcular_pesos_dinamicos(user_question, topic)
         candidate_ids = set(faiss_results.keys()) | set(bm25_results.keys())
-
         min_faiss, max_faiss = (min(faiss_results.values()), max(faiss_results.values())) if faiss_results else (0.0, 0.0)
         min_bm25, max_bm25 = (min(bm25_results.values()), max(bm25_results.values())) if bm25_results else (0.0, 0.0)
-
-        hybrid_scores = {}
-        for idx in candidate_ids:
-            norm_f = norm_score(faiss_results.get(idx, 0.0), min_faiss, max_faiss)
-            norm_b = norm_score(bm25_results.get(idx, 0.0), min_bm25, max_bm25)
-            hybrid_scores[idx] = (peso_emb * norm_f) + (peso_bm25 * norm_b)
+        hybrid_scores = {idx: (peso_emb * norm_score(faiss_results.get(idx, 0.0), min_faiss, max_faiss)) + (peso_bm25 * norm_score(bm25_results.get(idx, 0.0), min_bm25, max_bm25)) for idx in candidate_ids}
 
         sorted_hybrid_ids = sorted(hybrid_scores, key=hybrid_scores.get, reverse=True)[:K_RERANK]
-        
         rerank_pairs = [[user_question, app_state["texts"][idx]] for idx in sorted_hybrid_ids]
-        if not rerank_pairs:
-             return {"answer": "No he encontrado documentos candidatos para tu pregunta."}
+        if not rerank_pairs: return {"answer": "No he encontrado documentos candidatos."}
         
         reranker_scores = app_state["reranker"].predict(rerank_pairs)
-        
-        reranked_docs_info = []
-        for i, doc_id in enumerate(sorted_hybrid_ids):
-            reranked_docs_info.append({
-                "doc_id": doc_id,
-                "text": app_state["texts"][doc_id],
-                "metadata": app_state["metadatas"][doc_id],
-                "reranker_score": float(reranker_scores[i])
-            })
-        reranked_docs_info.sort(key=lambda x: x["reranker_score"], reverse=True)
+        reranked_docs_info = sorted([{"doc_id": doc_id, "text": app_state["texts"][doc_id], "metadata": app_state["metadatas"][doc_id], "reranker_score": float(reranker_scores[i])} for i, doc_id in enumerate(sorted_hybrid_ids)], key=lambda x: x["reranker_score"], reverse=True)
 
-        # --- 3. Selección Final de Contexto ---
         final_top_docs = []
         if USE_DYNAMIC_K:
             selected_for_dynamic_k = [doc for doc in reranked_docs_info if doc["reranker_score"] >= RERANKER_SCORE_THRESHOLD]
-            if len(selected_for_dynamic_k) < MIN_CHUNKS_DYNAMIC:
-                final_top_docs = reranked_docs_info[:MIN_CHUNKS_DYNAMIC]
-            else:
-                final_top_docs = selected_for_dynamic_k[:MAX_CHUNKS_DYNAMIC]
+            final_top_docs = reranked_docs_info[:MIN_CHUNKS_DYNAMIC] if len(selected_for_dynamic_k) < MIN_CHUNKS_DYNAMIC else selected_for_dynamic_k[:MAX_CHUNKS_DYNAMIC]
         else:
-            # K_FINAL no está definido en el scope, usamos un valor fijo o lo defines arriba
             final_top_docs = reranked_docs_info[:3]
 
         context = "\n\n---\n\n".join([doc['text'] for doc in final_top_docs])
-        
-        if not context:
-            return {"answer": "Lo siento, no he encontrado información suficientemente relevante para responder a tu pregunta."}
+        if not context: return {"answer": "No he encontrado información relevante."}
 
-        # --- 4. Generación de Respuesta con el LLM ---
-        qa_prompt_template = ChatPromptTemplate.from_messages([
-            ("system", "Eres un asistente experto. Responde de forma clara y concisa basándote únicamente en el contexto proporcionado. Si la información no está en el contexto, indícalo."),
-            ("human", "Contexto:\n{context}\n\nPregunta:\n{question}")
-        ])
-        
-        rag_chain = (
-            {"context": lambda x: context, "question": RunnablePassthrough()}
-            | qa_prompt_template
-            | app_state["llm"]
-            | StrOutputParser()
-        )
-        
+        qa_prompt_template = ChatPromptTemplate.from_messages([("system", "Responde basándote solo en el contexto."), ("human", "Contexto:\n{context}\n\nPregunta:\n{question}")])
+        rag_chain = ({"context": lambda x: context, "question": RunnablePassthrough()} | qa_prompt_template | app_state["llm"] | StrOutputParser())
         final_answer = rag_chain.invoke(user_question)
         
-        return {"answer": final_answer, "retrieved_context_for_debug": context}
-
+        return {"answer": final_answer}
     except Exception as e:
-        print(f"ERROR DURANTE LA EJECUCIÓN DE /ask: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en /ask: {e}")
+
+# --- Endpoint para procesar y guardar PDFs ---
+def embed_batch(batch_texts: list[str]) -> list[list[float]]:
+    if "embeddings_model" not in app_state: initialize_retriever()
+    embeddings_model = app_state.get("embeddings_model")
+    return embeddings_model.embed_documents(batch_texts)
+
+@app.post("/process-and-save-pdf")
+async def process_and_save_pdf(file: UploadFile = File(...)):
+    if "pinecone_index_for_upsert" not in app_state: initialize_retriever()
+    pinecone_index = app_state.get("pinecone_index_for_upsert")
+    if not pinecone_index:
+        raise HTTPException(status_code=503, detail="La conexión a Pinecone no está disponible.")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+        temp_pdf_path = temp_pdf.name
+        temp_pdf.write(await file.read())
+
+    try:
+        extraction_result = extract_and_clean_pdf_smart_stem(pdf_path=temp_pdf_path)
+        cleaned_text = extraction_result.get("cleaned_text")
+        if not cleaned_text: return {"status": "success", "vectors_added": 0}
+        
+        chunks = chunk_text_by_sentences(cleaned_text)
+        if not chunks: return {"status": "success", "vectors_added": 0}
+            
+        vectors_to_upsert = []
+        for i in range(0, len(chunks), 100):
+            batch_chunks = chunks[i : i + 100]
+            batch_embeddings = embed_batch(batch_chunks)
+
+            for j, chunk_text in enumerate(batch_chunks):
+                vectors_to_upsert.append({
+                    "id": str(uuid.uuid4()),
+                    "values": batch_embeddings[j],
+                    "metadata": {"text": chunk_text, "original_filename": file.filename, "chunk_index": i + j}
+                })
+        
+        if vectors_to_upsert:
+            pinecone_index.upsert(vectors=vectors_to_upsert)
+        
+        return {"status": "success", "vectors_added": len(vectors_to_upsert)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en /process-and-save-pdf: {e}")
+    finally:
+        if os.path.exists(temp_pdf_path):
+            os.unlink(temp_pdf_path)
      
