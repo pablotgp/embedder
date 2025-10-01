@@ -35,17 +35,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 
 
-import nltk
-nltk.download('punkt')
-from nltk.tokenize import sent_tokenize
-
-# Asegúrate de que punkt esté descargado
-try:
-    nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
-    print("Descargando 'punkt'...")
-    nltk.download('punkt', quiet=True)
-
 
 load_dotenv()
 
@@ -80,9 +69,10 @@ def initialize_retriever():
 
         # Cargar modelos de IA (OpenAI y Google)
         print("  LazyLoad: 1. Cargando modelos de IA...")
-        app_state["embeddings_model"] = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME, api_key=os.getenv("OPENAI_API_KEY"))
+        # NOTA: Los clientes de LangChain leen las claves de entorno automáticamente.
+        app_state["embeddings_model"] = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
         app_state["reranker"] = CrossEncoder(RERANKER_MODEL)
-        app_state["llm"] = ChatGoogleGenerativeAI(model=LLM_MODEL_NAME, google_api_key=os.getenv("GOOGLE_API_KEY"))
+        app_state["llm"] = ChatGoogleGenerativeAI(model=LLM_MODEL_NAME)
         print("     Modelos de IA cargados.")
 
         # Conectar a Pinecone y descargar datos
