@@ -1,22 +1,13 @@
-# --- Framework Web ---
 fastapi
-uvicorn
-pydantic
-python-dotenv
-python-multipart
-
-# --- Lógica de RAG y Búsqueda ---
-pinecone
+uvicorn[standard]
+pypdf2
+PyMuPDF
+nltk
 faiss-cpu
-numpy
-rank_bm25
-sentence-transformers
-
-# --- Lógica de Lenguaje (LLMs y Embeddings) ---
+python-dotenv
+langchain
 langchain-openai
 langchain-google-genai
-langchain-core
-nltk
-
-# --- Herramientas de PDF (aunque no se use en /ask, la importación existe) ---
-PyMuPDF
+rank-bm25
+sentence-transformers
+pinecone-client
